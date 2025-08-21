@@ -1,4 +1,8 @@
+if (AMD_CHAT_SERVER_DLL)
+set(TARGET server)
+else()
 set(TARGET llama-server)
+endif()
 
 option(LLAMA_SERVER_SSL "Build SSL support for the server" OFF)
 
@@ -9,9 +13,14 @@ if (MINGW)
     add_compile_definitions(_WIN32_WINNT=${GGML_WIN_VER})
 endif()
 
+if (AMD_CHAT_SERVER_DLL)
+    message(STATUS "***AMD*** building server.dll")
+endif()
+
 set(TARGET_SRCS
     server.cpp
     utils.hpp
+    dllmain.cpp
 )
 set(PUBLIC_ASSETS
     index.html.gz
@@ -30,7 +39,11 @@ foreach(asset ${PUBLIC_ASSETS})
     set_source_files_properties(${output} PROPERTIES GENERATED TRUE)
 endforeach()
 
+if (AMD_CHAT_SERVER_DLL)
+add_library(${TARGET} SHARED ${TARGET_SRCS})
+else()
 add_executable(${TARGET} ${TARGET_SRCS})
+endif()
 install(TARGETS ${TARGET} RUNTIME)
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)

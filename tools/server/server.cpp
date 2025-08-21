@@ -31,6 +31,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "server_amd.hpp"
+
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
@@ -54,6 +56,7 @@ enum slot_state {
 enum server_state {
     SERVER_STATE_LOADING_MODEL,  // Server is starting up, model not fully loaded yet
     SERVER_STATE_READY,          // Server is ready and model is loaded
+    SERVER_STATE_ERROR
 };
 
 enum server_task_type {
@@ -1977,6 +1980,23 @@ struct server_context {
 
     server_metrics metrics;
 
+    // handle amd chat tasks
+    AmdChatTaskHandler amd_chat;
+
+    // handler routine for amd chat
+    std::map<std::string, httplib::Server::Handler> amd_chat_handlers;
+
+    server_state state;
+    std::timed_mutex mutex_state;
+    std::condition_variable_any condition_state;
+
+    void set_state(server_state state_) {
+        std::unique_lock<std::timed_mutex> lck(mutex_state);
+        state = state_;
+        condition_state.notify_all();
+    }
+
+
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
 
@@ -3813,7 +3833,31 @@ inline void signal_handler(int signal) {
     shutdown_handler(signal);
 }
 
+// make sure to update this when making changes to server dll export
+int server_get_interface_version() {
+    return 20250821;
+}
+
+int terminate_server(void *ctx) {
+    if (shutdown_handler != nullptr)
+        shutdown_handler(SIGINT);
+
+    if (ctx != nullptr) {
+        server_context *ctx_server = (server_context*)ctx;
+        ctx_server->queue_results.terminate();
+        delete ctx_server;
+    }
+
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    // struct that contains llama context and inference
+    server_context ctx_server;
+    return server_main(&ctx_server, argc, argv);
+}
+
+int server_main(void *ctx, int argc, char ** argv) {
     // own arguments required by this example
     common_params params;
 
@@ -3823,8 +3867,15 @@ int main(int argc, char ** argv) {
 
     common_init();
 
+    const bool verbose = params.verbosity > 9;
+    if(!verbose) {
+        amd_log_set();
+        llama_log_set(amd_llama_log_callback, nullptr);
+    }
+    LOG_INF("verbosity: %s\n", params.verbosity);
+
     // struct that contains llama context and inference
-    server_context ctx_server;
+    server_context &ctx_server = *(server_context *)ctx;
 
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -3854,6 +3905,7 @@ int main(int argc, char ** argv) {
 #endif
 
     std::atomic<server_state> state{SERVER_STATE_LOADING_MODEL};
+    ctx_server.set_state(state);
 
     svr->set_default_headers({{"Server", "llama.cpp"}});
     svr->set_logger(log_server_request);
@@ -5023,6 +5075,13 @@ int main(int argc, char ** argv) {
     // Save & load slots
     svr->Get (params.api_prefix + "/slots",               handle_slots);
     svr->Post(params.api_prefix + "/slots/:id_slot",      handle_slots_action);
+    // register handlers for amd chat
+    ctx_server.amd_chat_handlers.insert({
+        {params.api_prefix + "/v1/chat/completions",    handle_chat_completions},
+        {params.api_prefix + "/v1/embeddings",          handle_embeddings_oai},
+        {params.api_prefix + "/v1/rerank",              handle_rerank},
+        {params.api_prefix + "/tokenize",               handle_tokenize},
+    });
 
     //
     // Start the server
@@ -5042,6 +5101,7 @@ int main(int argc, char ** argv) {
         llama_backend_free();
     };
 
+#ifdef AMD_CHAT_SERVER_HTTP
     bool was_bound = false;
     bool is_sock = false;
     if (string_ends_with(std::string(params.hostname), ".sock")) {
@@ -5075,19 +5135,25 @@ int main(int argc, char ** argv) {
     svr->wait_until_ready();
 
     LOG_INF("%s: HTTP server is listening, hostname: %s, port: %d, http threads: %d\n", __func__, params.hostname.c_str(), params.port, params.n_threads_http);
+#endif
 
     // load the model
     LOG_INF("%s: loading model\n", __func__);
 
     if (!ctx_server.load_model(params)) {
+        state.store(SERVER_STATE_ERROR);
+        ctx_server.set_state(state);
         clean_up();
+#ifdef AMD_CHAT_SERVER_HTTP
         t.join();
+#endif
         LOG_ERR("%s: exiting due to model loading error\n", __func__);
         return 1;
     }
 
     ctx_server.init();
     state.store(SERVER_STATE_READY);
+    ctx_server.set_state(state);
 
     LOG_INF("%s: model loaded\n", __func__);
 
@@ -5123,15 +5189,124 @@ int main(int argc, char ** argv) {
     SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif
 
+#ifdef AMD_CHAT_SERVER_HTTP
     LOG_INF("%s: server is listening on %s - starting the main loop\n", __func__,
             is_sock ? string_format("unix://%s", params.hostname.c_str()).c_str() :
                       string_format("http://%s:%d", params.hostname.c_str(), params.port).c_str());
+#endif
 
     // this call blocks the main thread until queue_tasks.terminate() is called
     ctx_server.queue_tasks.start_loop();
 
     clean_up();
+#ifdef AMD_CHAT_SERVER_HTTP
     t.join();
+#endif
+    return 0;
+}
 
+inline int server_handle_task(void* ctx, const char *req_body, std::string endpoint) {
+    server_context& ctx_server = *(server_context*)ctx;
+
+    auto handler = ctx_server.amd_chat_handlers.find(endpoint);
+    if (handler == ctx_server.amd_chat_handlers.end()) {
+        return -1;
+    }
+
+    auto task = ctx_server.amd_chat.run_task(req_body, handler->second);
+    if (nullptr == task) {
+        return -1;
+    }
+
+    return task->id_task;
+}
+
+int server_post_completions(void* ctx, const char *req_body) {
+    return server_handle_task(ctx, req_body, "/v1/chat/completions");
+}
+
+int server_post_embeddings(void* ctx, const char* req_body) {
+    return server_handle_task(ctx, req_body, "/v1/embeddings");
+}
+
+int server_post_reranking(void * ctx, const char * req_body) {
+    return server_handle_task(ctx, req_body, "/v1/rerank");
+}
+
+int server_post_tokenize(void * ctx, const char * req_body) {
+    return server_handle_task(ctx, req_body, "/tokenize");
+}
+
+void* create_server_context() {
+    // TODO we need to clean up?
+    server_context* ctx = new server_context();
+    return ctx;
+}
+
+size_t server_get_output(void* ctx, int id_task, char* dst, size_t dst_size, unsigned long timeout) {
+    server_context& ctx_server = *(server_context*)ctx;
+    auto task = ctx_server.amd_chat.find_task_by_id(id_task);
+    if (nullptr != task) {
+        return task->output_buffer.copy_output(dst, dst_size, timeout);
+    }
+    return 0;
+}
+
+bool server_get_output_done(void* ctx, int id_task) {
+    server_context& ctx_server = *(server_context*)ctx;
+    auto task = ctx_server.amd_chat.find_task_by_id(id_task);
+    if (nullptr != task) {
+        return task->closed;
+    }
+    return true;
+}
+
+void server_stop_output(void* ctx, int id_task) {
+    server_context& ctx_server = *(server_context*)ctx;
+    auto task = ctx_server.amd_chat.find_task_by_id(id_task);
+    if (nullptr != task) {
+        task->closed = true;
+    }
+}
+
+bool server_wait_for_ready(void* ctx, unsigned long timeout) {
+    server_context& ctx_server = *(server_context*)ctx;
+
+    std::unique_lock<std::timed_mutex> lck(ctx_server.mutex_state);
+
+    while (ctx_server.state == SERVER_STATE_LOADING_MODEL) {
+        if (ctx_server.condition_state.wait_for(lck, std::chrono::seconds(timeout)) != std::cv_status::timeout) {
+            if (ctx_server.state == SERVER_STATE_READY) {
+                return true;
+            }
+            else if (ctx_server.state == SERVER_STATE_ERROR) {
+                return false;
+            }
+            else {
+                continue;
+            }
+        }
+    }
+
+    return true;
+}
+
+void server_flush_log(char* log_file) {
+    amd_log_flush_to_file(log_file);
+}
+
+int server_slot_action(void* ctx, const char* req_body, int id_slot, server_task_type task_type) {
+    return 0;
+}
+
+int server_save_slot(void* ctx, const char* req_body, int id_slot) {
+    return server_slot_action(ctx, req_body, id_slot, SERVER_TASK_TYPE_SLOT_SAVE);
+}
+
+int server_restore_slot(void* ctx, const char* req_body, int id_slot) {
+    return server_slot_action(ctx, req_body, id_slot, SERVER_TASK_TYPE_SLOT_RESTORE);
+}
+
+int server_erase_slot(void* ctx, int id_slot) {
     return 0;
 }

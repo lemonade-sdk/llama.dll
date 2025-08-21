@@ -6,8 +6,11 @@
 #include <cstdio>
 #include <mutex>
 #include <sstream>
+#include <fstream>
 #include <thread>
 #include <vector>
+
+bool use_amd_log = false;
 
 int common_log_verbosity_thold = LOG_DEFAULT_LLAMA;
 
@@ -372,7 +375,14 @@ void common_log_free(struct common_log * log) {
 void common_log_add(struct common_log * log, enum ggml_log_level level, const char * fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    log->add(level, fmt, args);
+    if (use_amd_log)
+    {
+        amd_log_add(level, fmt, args);
+    }
+    else
+    {
+        log->add(level, fmt, args);
+    }
     va_end(args);
 }
 
@@ -391,3 +401,65 @@ void common_log_set_prefix(struct common_log * log, bool prefix) {
 void common_log_set_timestamps(struct common_log * log, bool timestamps) {
     log->set_timestamps(timestamps);
 }
+
+std::stringstream amd_server_log;
+std::mutex amd_server_log_mutex;
+
+void amd_log_set()
+{
+    use_amd_log = true;
+}
+
+void amd_log_add(enum ggml_log_level level, const char* text) {
+    // if (level >= GGML_LOG_LEVEL_DEBUG)
+    //     return;
+    if (level == GGML_LOG_LEVEL_DEBUG && common_log_verbosity_thold < LOG_DEFAULT_DEBUG) {
+        return;
+    }
+
+    std::unique_lock<std::mutex> lock(amd_server_log_mutex);
+
+    amd_server_log << text;
+}
+
+
+void amd_log_add(enum ggml_log_level level, const char* fmt, va_list args) {
+    // if (level >= GGML_LOG_LEVEL_DEBUG)
+    //     return;
+    if (level == GGML_LOG_LEVEL_DEBUG && common_log_verbosity_thold < LOG_DEFAULT_DEBUG) {
+        return;
+    }
+
+    std::unique_lock<std::mutex> lock(amd_server_log_mutex);
+
+    std::vector<char> msg;
+
+    va_list args_copy;
+    va_copy(args_copy, args);
+    const size_t n = vsnprintf(msg.data(), msg.size(), fmt, args);
+    if (n >= msg.size()) {
+        msg.resize(n + 1);
+        vsnprintf(msg.data(), msg.size(), fmt, args_copy);
+    }
+
+    amd_server_log << msg.data();
+}
+
+void amd_log_flush_to_file(char* log_file)
+{
+    std::unique_lock<std::mutex> lock(amd_server_log_mutex);
+
+    if (NULL != log_file)
+    {
+        std::ofstream log(log_file, std::ios::app);
+        log << amd_server_log.str();
+    }
+
+    amd_server_log.str("");
+}
+
+void amd_llama_log_callback(ggml_log_level level, const char* text, void* user_data) {
+    (void)user_data;
+    amd_log_add(level, text);
+}
+
