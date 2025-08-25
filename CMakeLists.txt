@@ -46,6 +46,8 @@ else()
 endif()
 
 option(BUILD_SHARED_LIBS "build shared libraries" ${BUILD_SHARED_LIBS_DEFAULT})
+option(AMD_CHAT_SERVER_DLL "amd: amd chat server dll" OFF)
+option(AMD_CHAT_SERVER_HTTP "amd: amd chat server http server" OFF)
 
 if (WIN32)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)

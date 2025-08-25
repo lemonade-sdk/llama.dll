@@ -24,6 +24,8 @@
 #define LOG_DEFAULT_DEBUG 1
 #define LOG_DEFAULT_LLAMA 0
 
+extern bool use_amd_log;
+
 // needed by the LOG_TMPL macro to avoid computing log arguments if the verbosity lower
 // set via common_log_set_verbosity()
 extern int common_log_verbosity_thold;
@@ -79,6 +81,12 @@ void common_log_set_timestamps(struct common_log * log,       bool   timestamps)
 //
 // this will avoid calling expensive_function() if LOG_DEFAULT_DEBUG > common_log_verbosity_thold
 //
+
+void amd_log_set();
+void amd_log_add(enum ggml_log_level level, const char* text);
+void amd_log_add(enum ggml_log_level level, const char* fmt, va_list args);
+void amd_log_flush_to_file(char* log_file);
+void amd_llama_log_callback(ggml_log_level level, const char* text, void* user_data);
 
 #define LOG_TMPL(level, verbosity, ...) \
     do { \
